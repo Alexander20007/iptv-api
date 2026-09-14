@@ -31,7 +31,8 @@ def clean_url(url: str) -> str:
     return "".join(url.split())
 
 
-@app.get("/health")
+# Aceita GET e HEAD (UptimeRobot free só manda HEAD)
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
@@ -40,9 +41,9 @@ async def health():
 # VERIFICAÇÃO E SALVAMENTO DOS CANAIS ONLINE
 # ─────────────────────────────────────────────────────
 
-@app.get("/cron/update")
+@app.api_route("/cron/update", methods=["GET", "HEAD"])
 async def cron_update(
-    limit: int = 500,
+    limit: int = 100,
     offset: int = 0,
     concurrency: int = 30,
     ffprobe: bool = False,
@@ -97,7 +98,6 @@ async def cron_update(
                 })
 
         if online:
-            # upsert em lotes (evita payload grande)
             batch_size = 100
             for i in range(0, len(online), batch_size):
                 supabase.table("channels_online").upsert(
@@ -137,13 +137,12 @@ async def cron_update(
 # BAIXAR E SALVAR EPG NO CACHE
 # ─────────────────────────────────────────────────────
 
-@app.get("/cron/epg")
+@app.api_route("/cron/epg", methods=["GET", "HEAD"])
 async def cron_epg():
     """
     Baixa os EPGs do M3U (url-tvg), parseia e salva no cache.
     Só salva programação dos canais que estão em channels_online.
     """
-    # 1) Lê M3U pra pegar a lista de EPGs e os tvg_ids dos canais online
     resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
     if not resp.data:
         raise HTTPException(404, "URL do M3U não encontrada")
@@ -189,7 +188,6 @@ async def cron_epg():
     # Salva no cache
     saved = 0
     for tvg_id, programs in merged.items():
-        # Remove duplicatas (mesmo início)
         seen = set()
         unique = []
         for p in sorted(programs, key=lambda x: x["inicio"]):
@@ -212,10 +210,10 @@ async def cron_epg():
 
 
 # ─────────────────────────────────────────────────────
-# CONSULTAS (não são usadas pelo site, mas úteis pra debug)
+# CONSULTAS DE DEBUG
 # ─────────────────────────────────────────────────────
 
-@app.get("/debug/m3u-url")
+@app.api_route("/debug/m3u-url", methods=["GET", "HEAD"])
 async def debug_m3u_url():
     resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
     if not resp.data:
@@ -229,13 +227,13 @@ async def debug_m3u_url():
     }
 
 
-@app.get("/debug/online-count")
+@app.api_route("/debug/online-count", methods=["GET", "HEAD"])
 async def debug_online_count():
     resp = supabase.table("channels_online").select("id", count="exact").execute()
     return {"online_canais": resp.count or 0}
 
 
-@app.get("/debug/epg-sample")
+@app.api_route("/debug/epg-sample", methods=["GET", "HEAD"])
 async def debug_epg_sample(tvg_id: str = Query(...)):
     resp = supabase.table("epg_cache").select("*").eq("tvg_id", tvg_id).execute()
     if not resp.data:
