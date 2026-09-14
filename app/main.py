@@ -40,20 +40,17 @@ async def health():
 
 # ─────────────────────────────────────────────────────
 # CRON MESTRE: /cron/next
-# Processa 1 lote por vez e guarda o offset na sync_progress.
+# Ajustado para plano Free do Render:
+#   batch_size=20 (era 50)
+#   concurrency=8 (era 30)
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/next", methods=["GET", "HEAD"])
-async def cron_next(batch_size: int = 50, mode: str = "deep"):
-    """
-    Processa o próximo lote de canais.
-    Cada execução:
-      1. Lê o offset atual da tabela sync_progress
-      2. Processa `batch_size` canais a partir desse offset
-      3. Salva os online em channels_online
-      4. Atualiza o offset na sync_progress
-      5. Se passou do total, reinicia do 0
-    """
+async def cron_next(
+    batch_size: int = 20,
+    mode: str = "deep",
+    concurrency: int = 8,
+):
     log = supabase.table("sync_log").insert({"status": "running"}).execute()
     log_id = log.data[0]["id"] if log.data else None
 
@@ -61,7 +58,6 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
         # 1) Lê offset atual
         prog = supabase.table("sync_progress").select("*").eq("id", 1).execute()
         if not prog.data:
-            # Se não existe, cria
             supabase.table("sync_progress").insert({"id": 1, "next_offset": 0}).execute()
             current_offset = 0
         else:
@@ -81,15 +77,15 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
         all_channels = parse_m3u(m3u_content)
         total = len(all_channels)
 
-        # 3) Se já passou do fim, reinicia do 0
+        # 3) Se já passou do fim, reinicia
         if current_offset >= total:
             current_offset = 0
 
         # 4) Pega o lote
         chunk = all_channels[current_offset:current_offset + batch_size]
 
-        # 5) Verifica em paralelo
-        sem = asyncio.Semaphore(30)
+        # 5) Verifica em paralelo (concurrency baixa = menos memória)
+        sem = asyncio.Semaphore(concurrency)
         tasks = [check_channel(ch, 10, 1, mode, sem) for ch in chunk]
         results = await asyncio.gather(*tasks)
 
@@ -116,7 +112,7 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             })
 
-        # 7) Upsert em lotes
+        # 7) Upsert
         saved = 0
         if online:
             for i in range(0, len(online), 50):
@@ -126,13 +122,13 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
                 ).execute()
                 saved += len(b)
 
-        # 8) Calcula próximo offset
+        # 8) Próximo offset
         next_offset = current_offset + batch_size
         finished_round = next_offset >= total
         if finished_round:
-            next_offset = 0  # reinicia na próxima rodada
+            next_offset = 0
 
-        # 9) Atualiza sync_progress
+        # 9) Atualiza progresso
         supabase.table("sync_progress").update({
             "next_offset": next_offset,
             "total_channels": total,
@@ -149,12 +145,16 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
                 "status": "done",
             }).eq("id", log_id).execute()
 
+        # Libera memória explicitamente
+        del all_channels, chunk, results, online
+
         return {
             "ok": True,
             "processed_offset": current_offset,
             "next_offset": next_offset,
             "total": total,
-            "batch_size": len(chunk),
+            "batch_size": len(chunk) if False else batch_size,
+            "concurrency": concurrency,
             "mode": mode,
             "online_neste_lote": saved,
             "rodada_completa": finished_round,
@@ -173,12 +173,11 @@ async def cron_next(batch_size: int = 50, mode: str = "deep"):
 
 
 # ─────────────────────────────────────────────────────
-# Endpoint para resetar o progresso (útil se travar)
+# Reset de progresso
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/reset", methods=["GET", "HEAD"])
 async def cron_reset():
-    """Reseta o offset da sincronização para 0."""
     supabase.table("sync_progress").update({
         "next_offset": 0,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -187,7 +186,7 @@ async def cron_reset():
 
 
 # ─────────────────────────────────────────────────────
-# CRON: BAIXAR EPG E SALVAR CACHE (mantido, 1x por dia)
+# CRON EPG (com concurrency controlada)
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/epg", methods=["GET", "HEAD"])
@@ -216,7 +215,8 @@ async def cron_epg():
     online_tvg_ids = {row["tvg_id"] for row in (resp.data or []) if row.get("tvg_id")}
 
     merged: dict = {}
-    for epg_url in epg_urls:
+    # Limita a 10 EPGs por execução pra não estourar memória
+    for epg_url in epg_urls[:10]:
         try:
             async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
                 r = await client.get(epg_url)
@@ -226,6 +226,7 @@ async def cron_epg():
                 for tvg_id, programs in parsed.items():
                     if tvg_id in online_tvg_ids:
                         merged.setdefault(tvg_id, []).extend(programs)
+                del parsed, r
         except Exception as e:
             print(f"Erro EPG {epg_url}: {e}")
             continue
@@ -245,7 +246,7 @@ async def cron_epg():
         }, on_conflict="tvg_id").execute()
         saved += 1
 
-    return {"ok": True, "epgs_baixados": len(epg_urls), "canais_com_epg": saved}
+    return {"ok": True, "epgs_baixados": min(len(epg_urls), 10), "canais_com_epg": saved}
 
 
 # ─────────────────────────────────────────────────────
@@ -273,7 +274,6 @@ async def debug_online_count():
 
 @app.api_route("/debug/progress", methods=["GET", "HEAD"])
 async def debug_progress():
-    """Mostra o estado atual da sincronização."""
     resp = supabase.table("sync_progress").select("*").eq("id", 1).execute()
     if not resp.data:
         return {"ok": False, "error": "sync_progress não inicializado"}
