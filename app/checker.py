@@ -86,8 +86,13 @@ def ffprobe_check(url: str, timeout: int) -> Dict:
         return {"ok": False, "error": str(e)}
 
 
-async def check_channel(channel: Dict, timeout: int, retries: int,
-                        use_ffprobe: bool, sem: asyncio.Semaphore) -> Dict:
+async def check_channel(
+    channel: Dict,
+    timeout: int,
+    retries: int,
+    use_ffprobe: bool,
+    sem: asyncio.Semaphore,
+) -> Dict:
     async with sem:
         result = {
             "name": channel["name"],
@@ -102,6 +107,10 @@ async def check_channel(channel: Dict, timeout: int, retries: int,
             "resolution": None,
             "error": None,
         }
+
+        if not channel["url"]:
+            result["error"] = "sem URL"
+            return result
 
         http_res = await http_check(channel["url"], timeout, retries)
         result["http_status"] = http_res.get("http_status")
