@@ -39,23 +39,38 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────
-# CRON: VERIFICAR E SALVAR CANAIS ONLINE
+# CRON MESTRE: /cron/next
+# Processa 1 lote por vez e guarda o offset na sync_progress.
 # ─────────────────────────────────────────────────────
 
-@app.api_route("/cron/update", methods=["GET", "HEAD"])
-async def cron_update(
-    limit: int = 50,
-    offset: int = 0,
-    concurrency: int = 30,
-    mode: str = "deep",
-):
+@app.api_route("/cron/next", methods=["GET", "HEAD"])
+async def cron_next(batch_size: int = 50, mode: str = "deep"):
+    """
+    Processa o próximo lote de canais.
+    Cada execução:
+      1. Lê o offset atual da tabela sync_progress
+      2. Processa `batch_size` canais a partir desse offset
+      3. Salva os online em channels_online
+      4. Atualiza o offset na sync_progress
+      5. Se passou do total, reinicia do 0
+    """
     log = supabase.table("sync_log").insert({"status": "running"}).execute()
     log_id = log.data[0]["id"] if log.data else None
 
     try:
+        # 1) Lê offset atual
+        prog = supabase.table("sync_progress").select("*").eq("id", 1).execute()
+        if not prog.data:
+            # Se não existe, cria
+            supabase.table("sync_progress").insert({"id": 1, "next_offset": 0}).execute()
+            current_offset = 0
+        else:
+            current_offset = prog.data[0].get("next_offset") or 0
+
+        # 2) Baixa M3U
         resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
         if not resp.data:
-            raise HTTPException(404, "URL do M3U não encontrada em settings id=1")
+            raise HTTPException(404, "URL do M3U não encontrada")
         m3u_url = clean_url(resp.data[0]["m3u_url"])
 
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -65,16 +80,23 @@ async def cron_update(
 
         all_channels = parse_m3u(m3u_content)
         total = len(all_channels)
-        slice_ = all_channels[offset:offset + limit]
 
-        sem = asyncio.Semaphore(concurrency)
-        tasks = [check_channel(ch, 10, 1, mode, sem) for ch in slice_]
+        # 3) Se já passou do fim, reinicia do 0
+        if current_offset >= total:
+            current_offset = 0
+
+        # 4) Pega o lote
+        chunk = all_channels[current_offset:current_offset + batch_size]
+
+        # 5) Verifica em paralelo
+        sem = asyncio.Semaphore(30)
+        tasks = [check_channel(ch, 10, 1, mode, sem) for ch in chunk]
         results = await asyncio.gather(*tasks)
 
-        # Deduplica por stream
+        # 6) Dedup + payload
         seen = set()
         online = []
-        for ch, res in zip(slice_, results):
+        for ch, res in zip(chunk, results):
             if res["status"] != "online":
                 continue
             stream = ch["url"]
@@ -94,32 +116,48 @@ async def cron_update(
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             })
 
+        # 7) Upsert em lotes
         saved = 0
         if online:
-            batch_size = 50
-            for i in range(0, len(online), batch_size):
-                batch = online[i:i + batch_size]
+            for i in range(0, len(online), 50):
+                b = online[i:i + 50]
                 supabase.table("channels_online").upsert(
-                    batch, on_conflict="stream"
+                    b, on_conflict="stream"
                 ).execute()
-                saved += len(batch)
+                saved += len(b)
 
+        # 8) Calcula próximo offset
+        next_offset = current_offset + batch_size
+        finished_round = next_offset >= total
+        if finished_round:
+            next_offset = 0  # reinicia na próxima rodada
+
+        # 9) Atualiza sync_progress
+        supabase.table("sync_progress").update({
+            "next_offset": next_offset,
+            "total_channels": total,
+            "last_run_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", 1).execute()
+
+        # 10) Fecha log
         if log_id:
             supabase.table("sync_log").update({
                 "finished_at": datetime.now(timezone.utc).isoformat(),
-                "total_channels": len(slice_),
+                "total_channels": len(chunk),
                 "online_count": saved,
                 "status": "done",
             }).eq("id", log_id).execute()
 
         return {
             "ok": True,
-            "total_original": total,
-            "verificados": len(slice_),
-            "offset": offset,
-            "limit": limit,
+            "processed_offset": current_offset,
+            "next_offset": next_offset,
+            "total": total,
+            "batch_size": len(chunk),
             "mode": mode,
-            "online_salvos": saved,
+            "online_neste_lote": saved,
+            "rodada_completa": finished_round,
         }
 
     except Exception as e:
@@ -135,7 +173,21 @@ async def cron_update(
 
 
 # ─────────────────────────────────────────────────────
-# CRON: BAIXAR EPG E SALVAR CACHE
+# Endpoint para resetar o progresso (útil se travar)
+# ─────────────────────────────────────────────────────
+
+@app.api_route("/cron/reset", methods=["GET", "HEAD"])
+async def cron_reset():
+    """Reseta o offset da sincronização para 0."""
+    supabase.table("sync_progress").update({
+        "next_offset": 0,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
+    return {"ok": True, "message": "Progresso resetado"}
+
+
+# ─────────────────────────────────────────────────────
+# CRON: BAIXAR EPG E SALVAR CACHE (mantido, 1x por dia)
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/epg", methods=["GET", "HEAD"])
@@ -219,6 +271,23 @@ async def debug_online_count():
     return {"online_canais": resp.count or 0}
 
 
+@app.api_route("/debug/progress", methods=["GET", "HEAD"])
+async def debug_progress():
+    """Mostra o estado atual da sincronização."""
+    resp = supabase.table("sync_progress").select("*").eq("id", 1).execute()
+    if not resp.data:
+        return {"ok": False, "error": "sync_progress não inicializado"}
+    p = resp.data[0]
+    total = p.get("total_channels") or 0
+    offset = p.get("next_offset") or 0
+    return {
+        "next_offset": offset,
+        "total_channels": total,
+        "progresso_percent": round((offset / total * 100), 1) if total else 0,
+        "last_run_at": p.get("last_run_at"),
+    }
+
+
 @app.api_route("/debug/epg-sample", methods=["GET", "HEAD"])
 async def debug_epg_sample(tvg_id: str = Query(...)):
     resp = supabase.table("epg_cache").select("*").eq("tvg_id", tvg_id).execute()
@@ -229,7 +298,6 @@ async def debug_epg_sample(tvg_id: str = Query(...)):
 
 @app.api_route("/debug/parse", methods=["GET", "HEAD"])
 async def debug_parse(limit: int = 20, offset: int = 0):
-    """Mostra como o parser interpretou os canais (útil pra testar listas novas)."""
     resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
     if not resp.data:
         raise HTTPException(404, "URL do M3U não encontrada")
