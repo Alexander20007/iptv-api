@@ -21,3 +21,6 @@ __pycache__/
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Wheels locais (específicos do Termux/Android)
+*.whl
