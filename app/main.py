@@ -3,7 +3,7 @@ import re
 import asyncio
 import traceback
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Query
 from supabase import create_client, Client
 from .m3u_parser import parse_m3u
@@ -33,16 +33,33 @@ def clean_url(url: str) -> str:
     return "".join(url.split())
 
 
+def get_epg_urls_from_m3u(m3u_content: str) -> list:
+    for line in m3u_content.splitlines():
+        if line.startswith("#EXTM3U") and "url-tvg=" in line:
+            match = re.search(r'url-tvg="([^"]+)"', line)
+            if match:
+                return [u.strip() for u in match.group(1).split(",") if u.strip()]
+    return []
+
+
+async def fetch_m3u() -> str:
+    resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
+    if not resp.data:
+        raise HTTPException(404, "URL do M3U não encontrada")
+    m3u_url = clean_url(resp.data[0]["m3u_url"])
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(m3u_url)
+        r.raise_for_status()
+        return r.text
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
 # ─────────────────────────────────────────────────────
-# CRON MESTRE: /cron/next
-# Ajustado para plano Free do Render:
-#   batch_size=20 (era 50)
-#   concurrency=8 (era 30)
+# CRON CANAIS
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/next", methods=["GET", "HEAD"])
@@ -55,7 +72,6 @@ async def cron_next(
     log_id = log.data[0]["id"] if log.data else None
 
     try:
-        # 1) Lê offset atual
         prog = supabase.table("sync_progress").select("*").eq("id", 1).execute()
         if not prog.data:
             supabase.table("sync_progress").insert({"id": 1, "next_offset": 0}).execute()
@@ -63,33 +79,19 @@ async def cron_next(
         else:
             current_offset = prog.data[0].get("next_offset") or 0
 
-        # 2) Baixa M3U
-        resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
-        if not resp.data:
-            raise HTTPException(404, "URL do M3U não encontrada")
-        m3u_url = clean_url(resp.data[0]["m3u_url"])
-
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.get(m3u_url)
-            r.raise_for_status()
-            m3u_content = r.text
-
+        m3u_content = await fetch_m3u()
         all_channels = parse_m3u(m3u_content)
         total = len(all_channels)
 
-        # 3) Se já passou do fim, reinicia
         if current_offset >= total:
             current_offset = 0
 
-        # 4) Pega o lote
         chunk = all_channels[current_offset:current_offset + batch_size]
 
-        # 5) Verifica em paralelo (concurrency baixa = menos memória)
         sem = asyncio.Semaphore(concurrency)
         tasks = [check_channel(ch, 10, 1, mode, sem) for ch in chunk]
         results = await asyncio.gather(*tasks)
 
-        # 6) Dedup + payload
         seen = set()
         online = []
         for ch, res in zip(chunk, results):
@@ -112,7 +114,6 @@ async def cron_next(
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             })
 
-        # 7) Upsert
         saved = 0
         if online:
             for i in range(0, len(online), 50):
@@ -122,21 +123,17 @@ async def cron_next(
                 ).execute()
                 saved += len(b)
 
-        # 8) Próximo offset
         next_offset = current_offset + batch_size
         finished_round = next_offset >= total
         if finished_round:
             next_offset = 0
 
-        # 9) Atualiza progresso
         supabase.table("sync_progress").update({
             "next_offset": next_offset,
             "total_channels": total,
             "last_run_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", 1).execute()
 
-        # 10) Fecha log
         if log_id:
             supabase.table("sync_log").update({
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -145,24 +142,18 @@ async def cron_next(
                 "status": "done",
             }).eq("id", log_id).execute()
 
-        # Libera memória explicitamente
-        del all_channels, chunk, results, online
-
         return {
             "ok": True,
             "processed_offset": current_offset,
             "next_offset": next_offset,
             "total": total,
-            "batch_size": len(chunk) if False else batch_size,
-            "concurrency": concurrency,
-            "mode": mode,
             "online_neste_lote": saved,
             "rodada_completa": finished_round,
         }
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"ERRO COMPLETO:\n{tb}")
+        print(f"ERRO:\n{tb}")
         if log_id:
             supabase.table("sync_log").update({
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -172,99 +163,157 @@ async def cron_next(
         raise HTTPException(500, f"{type(e).__name__}: {str(e)[:200]}")
 
 
-# ─────────────────────────────────────────────────────
-# Reset de progresso
-# ─────────────────────────────────────────────────────
-
 @app.api_route("/cron/reset", methods=["GET", "HEAD"])
 async def cron_reset():
     supabase.table("sync_progress").update({
         "next_offset": 0,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", 1).execute()
     return {"ok": True, "message": "Progresso resetado"}
 
 
 # ─────────────────────────────────────────────────────
-# CRON EPG (com concurrency controlada)
+# EPG SOB DEMANDA ⭐
 # ─────────────────────────────────────────────────────
 
-@app.api_route("/cron/epg", methods=["GET", "HEAD"])
-async def cron_epg():
-    resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
-    if not resp.data:
-        raise HTTPException(404, "URL do M3U não encontrada")
-    m3u_url = clean_url(resp.data[0]["m3u_url"])
+@app.api_route("/cron/epg-index", methods=["GET", "HEAD"])
+async def cron_epg_index(idx: int = 0):
+    """
+    Popula a tabela epg_index: mapeia tvg_id → qual EPG contém ele.
+    Processa 1 EPG por chamada (chamado varias vezes com idx=0,1,2...).
+    """
+    try:
+        m3u_content = await fetch_m3u()
+        epg_urls = get_epg_urls_from_m3u(m3u_content)
 
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        r = await client.get(m3u_url)
-        m3u_content = r.text
+        if not epg_urls:
+            return {"ok": False, "error": "Nenhum EPG no M3U"}
 
-    epg_urls = []
-    for line in m3u_content.splitlines():
-        if line.startswith("#EXTM3U") and "url-tvg=" in line:
-            match = re.search(r'url-tvg="([^"]+)"', line)
-            if match:
-                epg_urls = [u.strip() for u in match.group(1).split(",") if u.strip()]
-            break
+        if idx >= len(epg_urls):
+            return {"ok": True, "message": "Índice completo", "total": len(epg_urls)}
 
-    if not epg_urls:
-        return {"ok": False, "error": "Nenhum EPG encontrado no M3U"}
+        epg_url = epg_urls[idx]
 
-    resp = supabase.table("channels_online").select("tvg_id").execute()
-    online_tvg_ids = {row["tvg_id"] for row in (resp.data or []) if row.get("tvg_id")}
+        # Baixa o EPG
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            r = await client.get(epg_url)
+            if r.status_code != 200:
+                return {"ok": False, "idx": idx, "error": f"HTTP {r.status_code}"}
 
-    merged: dict = {}
-    # Limita a 10 EPGs por execução pra não estourar memória
-    for epg_url in epg_urls[:10]:
-        try:
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                r = await client.get(epg_url)
-                if r.status_code != 200:
-                    continue
-                parsed = parse_epg_xml(r.content)
-                for tvg_id, programs in parsed.items():
-                    if tvg_id in online_tvg_ids:
-                        merged.setdefault(tvg_id, []).extend(programs)
-                del parsed, r
-        except Exception as e:
-            print(f"Erro EPG {epg_url}: {e}")
-            continue
+            content = r.content
+            # Descomprime se necessário (para extrair cabeçalhos)
+            import gzip
+            if content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
 
-    saved = 0
-    for tvg_id, programs in merged.items():
+            text = content.decode("utf-8", errors="ignore")
+
+        # Extrai os tvg_id (só cabeçalhos, rápido)
+        tvg_ids = re.findall(r'<channel\s+id="([^"]+)"', text)
+
+        # Salva no índice
+        if tvg_ids:
+            rows = [{"tvg_id": t.strip(), "epg_url": epg_url} for t in tvg_ids if t.strip()]
+            for i in range(0, len(rows), 500):
+                supabase.table("epg_index").upsert(
+                    rows[i:i + 500], on_conflict="tvg_id"
+                ).execute()
+
+        return {
+            "ok": True,
+            "idx": idx,
+            "total_epgs": len(epg_urls),
+            "tvg_ids_encontrados": len(tvg_ids),
+            "next_idx": idx + 1 if idx + 1 < len(epg_urls) else None,
+        }
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"ERRO EPG INDEX:\n{tb}")
+        raise HTTPException(500, f"{type(e).__name__}: {str(e)[:200]}")
+
+
+@app.api_route("/epg/on-demand", methods=["GET", "HEAD"])
+async def epg_on_demand(tvg_id: str = Query(...), force: bool = False):
+    """
+    Busca o EPG de UM canal sob demanda.
+    1. Verifica cache (epg_cache). Se tem e é fresco (< 6h), devolve.
+    2. Se não, consulta epg_index pra saber qual EPG baixar.
+    3. Baixa o EPG, filtra só esse tvg_id, salva no cache e devolve.
+    """
+    try:
+        # 1) Verifica cache
+        if not force:
+            cached = supabase.table("epg_cache").select("*").eq("tvg_id", tvg_id).execute()
+            if cached.data:
+                updated = cached.data[0].get("updated_at")
+                if updated:
+                    try:
+                        dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                        if datetime.now(timezone.utc) - dt < timedelta(hours=6):
+                            programs = cached.data[0]["programs"]
+                            return {
+                                "ok": True,
+                                "source": "cache",
+                                "tvg_id": tvg_id,
+                                **get_current_and_next(programs),
+                            }
+                    except Exception:
+                        pass
+
+        # 2) Descobre qual EPG contém esse tvg_id
+        idx_resp = supabase.table("epg_index").select("epg_url").eq("tvg_id", tvg_id).execute()
+        if not idx_resp.data:
+            return {
+                "ok": False,
+                "error": f"tvg_id '{tvg_id}' não está em nenhum EPG indexado",
+            }
+        epg_url = idx_resp.data[0]["epg_url"]
+
+        # 3) Baixa o EPG
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            r = await client.get(epg_url)
+            if r.status_code != 200:
+                return {"ok": False, "error": f"Falha ao baixar EPG (HTTP {r.status_code})"}
+
+            parsed = parse_epg_xml(r.content)
+
+        if tvg_id not in parsed:
+            return {"ok": False, "error": "Programação não encontrada no EPG"}
+
+        programs = parsed[tvg_id]
+
+        # 4) Remove duplicatas
         seen = set()
         unique = []
         for p in sorted(programs, key=lambda x: x["inicio"]):
             if p["inicio"] not in seen:
                 seen.add(p["inicio"])
                 unique.append(p)
+
+        # 5) Salva no cache
         supabase.table("epg_cache").upsert({
             "tvg_id": tvg_id,
             "programs": unique,
+            "source_epg_url": epg_url,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="tvg_id").execute()
-        saved += 1
 
-    return {"ok": True, "epgs_baixados": min(len(epg_urls), 10), "canais_com_epg": saved}
+        return {
+            "ok": True,
+            "source": "fresh",
+            "tvg_id": tvg_id,
+            **get_current_and_next(unique),
+        }
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"ERRO EPG ON-DEMAND:\n{tb}")
+        raise HTTPException(500, f"{type(e).__name__}: {str(e)[:200]}")
 
 
 # ─────────────────────────────────────────────────────
 # DEBUG
 # ─────────────────────────────────────────────────────
-
-@app.api_route("/debug/m3u-url", methods=["GET", "HEAD"])
-async def debug_m3u_url():
-    resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
-    if not resp.data:
-        raise HTTPException(404, "Nada em settings id=1")
-    raw = resp.data[0]["m3u_url"]
-    return {
-        "raw_length": len(raw),
-        "cleaned_url": clean_url(raw),
-        "has_whitespace": raw != clean_url(raw),
-    }
-
 
 @app.api_route("/debug/online-count", methods=["GET", "HEAD"])
 async def debug_online_count():
@@ -284,37 +333,16 @@ async def debug_progress():
         "next_offset": offset,
         "total_channels": total,
         "progresso_percent": round((offset / total * 100), 1) if total else 0,
-        "last_run_at": p.get("last_run_at"),
     }
 
 
-@app.api_route("/debug/epg-sample", methods=["GET", "HEAD"])
-async def debug_epg_sample(tvg_id: str = Query(...)):
-    resp = supabase.table("epg_cache").select("*").eq("tvg_id", tvg_id).execute()
-    if not resp.data:
-        raise HTTPException(404, "EPG não encontrado")
-    return get_current_and_next(resp.data[0]["programs"])
+@app.api_route("/debug/epg-index-count", methods=["GET", "HEAD"])
+async def debug_epg_index_count():
+    resp = supabase.table("epg_index").select("id", count="exact").execute()
+    return {"total_indexados": resp.count or 0}
 
 
-@app.api_route("/debug/parse", methods=["GET", "HEAD"])
-async def debug_parse(limit: int = 20, offset: int = 0):
-    resp = supabase.table("settings").select("m3u_url").eq("id", 1).execute()
-    if not resp.data:
-        raise HTTPException(404, "URL do M3U não encontrada")
-    m3u_url = clean_url(resp.data[0]["m3u_url"])
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        r = await client.get(m3u_url)
-        m3u_content = r.text
-
-    all_channels = parse_m3u(m3u_content)
-    slice_ = all_channels[offset:offset + limit]
-    return {
-        "total": len(all_channels),
-        "offset": offset,
-        "limit": limit,
-        "canais": [
-            {"name": c["name"], "group": c.get("group"), "url": c["url"]}
-            for c in slice_
-        ],
-    }
+@app.api_route("/debug/epg-cache-count", methods=["GET", "HEAD"])
+async def debug_epg_cache_count():
+    resp = supabase.table("epg_cache").select("id", count="exact").execute()
+    return {"total_em_cache": resp.count or 0}
