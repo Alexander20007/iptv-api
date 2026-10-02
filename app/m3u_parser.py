@@ -16,7 +16,6 @@ KNOWN_BRANDS = [
 
 
 def _infer_group_from_name(name: str) -> Optional[str]:
-    """Tenta inferir um grupo a partir do nome do canal."""
     if not name:
         return None
     name_lower = name.lower().strip()
@@ -29,9 +28,39 @@ def _infer_group_from_name(name: str) -> Optional[str]:
     return None
 
 
-def parse_m3u(content: str) -> List[Dict]:
+def _is_vod(group: str, name: str) -> bool:
+    """
+    Detecta se o canal é VOD (série, filme, episódio).
+    Retorna True se for VOD (não deve ser salvo).
+    """
+    g = (group or "").lower().strip()
+    n = (name or "").lower().strip()
+
+    # Grupos VOD
+    if re.match(r'^(serie|série|filme|movie|novela|show|anime|animes|documentario|documentário)\s*\|', g):
+        return True
+
+    # Nomes tipo episódio
+    if re.search(r'\bs\d+\s*e\d+\b', n):
+        return True
+    if re.search(r'\bt\d+\s*ep?\d+\b', n):
+        return True
+    if re.search(r'\b\d{1,2}x\d{1,2}\b', n):
+        return True
+    if re.search(r'temporada\s*\d+', n):
+        return True
+
+    return False
+
+
+def parse_m3u(content: str, skip_vod: bool = True) -> List[Dict]:
+    """
+    Parseia o M3U.
+    Se skip_vod=True, remove canais de VOD (séries, filmes, episódios).
+    """
     channels = []
     current = None
+
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -63,7 +92,11 @@ def parse_m3u(content: str) -> List[Dict]:
         else:
             if current is not None:
                 current["url"] = line
-                channels.append(current)
+
+                # Filtra VOD, se pedido
+                if not (skip_vod and _is_vod(current.get("group"), current.get("name"))):
+                    channels.append(current)
+
                 current = None
 
     return channels
