@@ -1,5 +1,6 @@
 import os
 import re
+import gzip
 import asyncio
 import traceback
 import httpx
@@ -59,7 +60,7 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────
-# CRON CANAIS
+# CRON CANAIS: /cron/next
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/next", methods=["GET", "HEAD"])
@@ -172,14 +173,14 @@ async def cron_reset():
 
 
 # ─────────────────────────────────────────────────────
-# EPG SOB DEMANDA ⭐
+# EPG SOB DEMANDA
 # ─────────────────────────────────────────────────────
 
 @app.api_route("/cron/epg-index", methods=["GET", "HEAD"])
 async def cron_epg_index(idx: int = 0):
     """
-    Popula a tabela epg_index: mapeia tvg_id → qual EPG contém ele.
-    Processa 1 EPG por chamada (chamado varias vezes com idx=0,1,2...).
+    Popula a tabela epg_index: mapeia tvg_id -> qual EPG contém ele.
+    Processa 1 EPG por chamada (chamado várias vezes com idx=0,1,2...).
     """
     try:
         m3u_content = await fetch_m3u()
@@ -193,24 +194,19 @@ async def cron_epg_index(idx: int = 0):
 
         epg_url = epg_urls[idx]
 
-        # Baixa o EPG
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             r = await client.get(epg_url)
             if r.status_code != 200:
                 return {"ok": False, "idx": idx, "error": f"HTTP {r.status_code}"}
 
             content = r.content
-            # Descomprime se necessário (para extrair cabeçalhos)
-            import gzip
             if content[:2] == b"\x1f\x8b":
                 content = gzip.decompress(content)
 
             text = content.decode("utf-8", errors="ignore")
 
-        # Extrai os tvg_id (só cabeçalhos, rápido)
         tvg_ids = re.findall(r'<channel\s+id="([^"]+)"', text)
 
-        # Salva no índice
         if tvg_ids:
             rows = [{"tvg_id": t.strip(), "epg_url": epg_url} for t in tvg_ids if t.strip()]
             for i in range(0, len(rows), 500):
@@ -236,9 +232,6 @@ async def cron_epg_index(idx: int = 0):
 async def epg_on_demand(tvg_id: str = Query(...), force: bool = False):
     """
     Busca o EPG de UM canal sob demanda.
-    1. Verifica cache (epg_cache). Se tem e é fresco (< 6h), devolve.
-    2. Se não, consulta epg_index pra saber qual EPG baixar.
-    3. Baixa o EPG, filtra só esse tvg_id, salva no cache e devolve.
     """
     try:
         # 1) Verifica cache
@@ -317,7 +310,7 @@ async def epg_on_demand(tvg_id: str = Query(...), force: bool = False):
 
 @app.api_route("/debug/online-count", methods=["GET", "HEAD"])
 async def debug_online_count():
-    resp = supabase.table("channels_online").select("id", count="exact").execute()
+    resp = supabase.table("channels_online").select("stream", count="exact").execute()
     return {"online_canais": resp.count or 0}
 
 
@@ -338,11 +331,22 @@ async def debug_progress():
 
 @app.api_route("/debug/epg-index-count", methods=["GET", "HEAD"])
 async def debug_epg_index_count():
-    resp = supabase.table("epg_index").select("id", count="exact").execute()
+    """Conta quantos tvg_ids estão indexados na epg_index."""
+    resp = supabase.table("epg_index").select("tvg_id", count="exact").execute()
     return {"total_indexados": resp.count or 0}
 
 
 @app.api_route("/debug/epg-cache-count", methods=["GET", "HEAD"])
 async def debug_epg_cache_count():
-    resp = supabase.table("epg_cache").select("id", count="exact").execute()
+    """Conta quantos canais têm EPG em cache."""
+    resp = supabase.table("epg_cache").select("tvg_id", count="exact").execute()
     return {"total_em_cache": resp.count or 0}
+
+
+@app.api_route("/debug/epg-sample", methods=["GET", "HEAD"])
+async def debug_epg_sample(tvg_id: str = Query(...)):
+    """Mostra o atual + próximo de um tvg_id específico (sem baixar nada)."""
+    resp = supabase.table("epg_cache").select("*").eq("tvg_id", tvg_id).execute()
+    if not resp.data:
+        raise HTTPException(404, "EPG não encontrado no cache")
+    return get_current_and_next(resp.data[0]["programs"])
